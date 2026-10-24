@@ -11,7 +11,9 @@ import os
 import struct
 import sys
 
-DUMP = os.environ.get("IEC_DUMP") or "/home/khadas/claude/earc-es-dump.eac3"
+# Set IEC_DUMP to a path to also keep a copy of the raw elementary stream, for
+# feeding to mediainfo or tools/eac3-joc.py. Off unless asked for.
+DUMP = os.environ.get("IEC_DUMP")
 DUMP_LIMIT = 1_500_000  # ~19 s at 640 kbps; self-limiting, then it stops
 
 SYNC = b"\x72\xf8\x1f\x4e"  # Pa=0xF872, Pb=0x4E1F as little-endian words
@@ -20,10 +22,12 @@ TYPES_LEN_IN_BITS = {1}     # AC-3 burst length (Pd) is in bits; E-AC-3 is in by
 
 def main():
     inp, out = sys.stdin.buffer, sys.stdout.buffer
-    try:
-        dump, dumped = open(DUMP, 'wb'), 0
-    except OSError:
-        dump, dumped = None, 0
+    dump, dumped = None, 0
+    if DUMP:
+        try:
+            dump = open(DUMP, 'wb')
+        except OSError:
+            dump = None
     buf = bytearray()
     warned = set()
     while True:
