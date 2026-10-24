@@ -68,7 +68,7 @@ afternoon.
 Board side:
 
 ```sh
-git clone https://github.com/<you>/vim3l-earc
+git clone https://github.com/rafaelmosquim/vim3l-earc
 cd vim3l-earc
 sudo bash install.sh              # or --no-oled
 ```
