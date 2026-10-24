@@ -1,0 +1,16 @@
+[Unit]
+Description=System volume on the front-panel OLED
+After=earc-streamer.service
+Wants=earc-streamer.service
+
+[Service]
+User=khadas
+Group=khadas
+SupplementaryGroups=i2c audio
+ExecStart=/usr/bin/python3 /usr/local/lib/earc/earc-oled.py
+Restart=always
+RestartSec=5
+Nice=5
+
+[Install]
+WantedBy=multi-user.target

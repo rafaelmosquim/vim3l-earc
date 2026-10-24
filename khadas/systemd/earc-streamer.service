@@ -1,0 +1,15 @@
+[Unit]
+Description=eARC capture -> TCP stream (5.1 s16le 48 kHz, port 4010)
+After=earc-cec.service network-online.target sound.target
+Wants=earc-cec.service network-online.target
+
+[Service]
+User=khadas
+Group=audio
+ExecStart=/usr/bin/python3 /usr/local/lib/earc/earc-streamer.py --port 4010
+Restart=always
+RestartSec=2
+Nice=-10
+
+[Install]
+WantedBy=multi-user.target

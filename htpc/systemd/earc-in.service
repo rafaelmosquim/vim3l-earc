@@ -1,0 +1,13 @@
+[Unit]
+Description=TV eARC 5.1 receiver (Khadas VIM3L 192.168.15.100:4010 -> CamillaIn)
+After=pipewire.service pipewire-pulse.service camilladsp.service
+Wants=pipewire.service pipewire-pulse.service
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/earc-in.sh
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=default.target

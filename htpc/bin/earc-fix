@@ -1,0 +1,30 @@
+#!/usr/bin/env bash
+# Installs the patched eARC streamer and CEC daemon onto the Khadas VIM3L and
+# restarts them. Kept as a script because the board needs an interactive sudo
+# password, which only a terminal the user controls can answer.
+#
+# Patched copies live in ~/.local/share/earc-khadas/ ; originals are backed up
+# on the board as *.bak before the first install.
+set -eu
+
+HOST="${EARC_SSH_HOST:-khadas@192.168.15.100}"
+SRC="$HOME/.local/share/earc-khadas"
+
+echo "Copying patched scripts to $HOST ..."
+scp -q "$SRC/earc-streamer.py" "$SRC/earc-cec-daemon.py" "$HOST:/tmp/"
+
+echo "Installing (enter the board's password when asked) ..."
+ssh -t "$HOST" '
+set -e
+sudo cp -n /usr/local/lib/earc/earc-streamer.py /usr/local/lib/earc/earc-streamer.py.bak || true
+sudo cp -n /usr/local/bin/earc-cec-daemon.py /usr/local/bin/earc-cec-daemon.py.bak || true
+sudo install -m755 /tmp/earc-streamer.py /usr/local/lib/earc/earc-streamer.py
+sudo install -m755 /tmp/earc-cec-daemon.py /usr/local/bin/earc-cec-daemon.py
+sudo systemctl restart earc-cec earc-streamer
+sleep 3
+echo
+echo "earc-cec:      $(systemctl is-active earc-cec)"
+echo "earc-streamer: $(systemctl is-active earc-streamer)"
+echo
+journalctl -u earc-streamer -n 8 --no-pager -o cat
+'

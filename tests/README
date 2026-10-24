@@ -1,0 +1,34 @@
+Click/pop regression tests for the eARC chain (2026-10-15).
+
+Every waveform discontinuity in the path is covered here. Run them after any
+change to earc-streamer.py's Output class or earc-recv.py's Buffer.
+
+  python3 tests/test_fade2.py        [path]   boundary ramps in isolation
+  python3 tests/test_output_e2e.py   [path]   the real Output class, start to finish
+  python3 tests/test_settle.py       [path]   the E-AC-3 decoder settling discard
+
+`path` defaults to the INSTALLED /usr/local/lib/earc/earc-streamer.py; pass
+~/claude/earc-streamer.py to test an uninstalled edit.
+
+On the HTPC (needs numpy, which is there):
+  scp tests/test_recv_fade2.py rafael@192.168.15.134:/tmp/ && \
+    ssh rafael@192.168.15.134 python3 -I /tmp/test_recv_fade2.py
+
+Read "FAIL   old behaviour for comparison" as expected: those rows assert the
+bug is still reproducible, and the suite's exit status ignores them.
+
+Use 997 Hz, never 1000 Hz. At 48 kHz a 1 kHz tone is exactly 48 samples per
+cycle, which aligns with every block length in the pipeline and hides phase
+discontinuities completely -- it hid a fade-out that was doing nothing at all.
+
+  python3 tests/test_gaphold.py      [path]   the gap-invalidates-format hold
+
+test_gaphold.py replays tests/data/junk-eac3-as-pcm.raw: 670 ms of the real
+output the LPCM pipeline produced on 2026-10-15 while the TV had already put
+an E-AC-3 bitstream on the wire. Keep that file. It is the only sample of the
+actual failure, it took a 4-minute live capture plus a channel change to get,
+and the test asserts both that it WOULD leak unguarded and that it does not now.
+
+Why the gap hold and not a content detector: the junk arrives in 13 ms bursts,
+shorter than any usable analysis window, so zero-crossing and level tests
+caught 4 of 34 chunks and fired 200 ms late. Measured, not assumed.

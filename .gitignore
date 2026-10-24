@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+# Captured audio: these are recordings of broadcast content, not test vectors.
+*.eac3
+*.wav
+*.bak
+*.before-*
+*.orig-*

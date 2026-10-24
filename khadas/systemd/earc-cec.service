@@ -1,0 +1,12 @@
+[Unit]
+Description=CEC Audio System responder for eARC input
+After=sound.target
+
+[Service]
+ExecStartPre=/bin/sleep 3
+ExecStart=/usr/bin/python3 /usr/local/bin/earc-cec-daemon.py
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target
