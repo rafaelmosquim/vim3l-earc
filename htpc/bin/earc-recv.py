@@ -22,11 +22,11 @@ the ceiling (sender running fast) we drop the oldest frames.
 The sender's clock and the DAC's never match exactly, so drops are routine, not
 just a recovery path: the buffer creeps up by the clock difference (~35 ppm
 against the Fosi ZD3, ~160 ppm against the UMC404HD, i.e. ~10 ms a minute) and
-the silence-debt payback below trims it back to the prefill level. A plain cut
-is a waveform discontinuity, heard as a click, so every drop is crossfaded over
-XFADE_MS from the audio before the cut into the audio after it, and the payback
-waits until the buffer is DROP_HYST_MS over target so it fires every minute or
-two (at UMC drift) rather than on every burst.
+the trim in put() takes it back to the prefill level. A plain cut is a waveform
+discontinuity, heard as a click, so every drop is crossfaded over XFADE_MS from
+the audio before the cut into the audio after it, and the trim waits until the
+buffer is DROP_HYST_MS over target so it fires every minute or two (at UMC
+drift) rather than on every burst.
 """
 import os
 import socket
@@ -59,7 +59,7 @@ DOWN_BACKOFF = (1.0, 2.0, 5.0, 10.0, 30.0)
 DOWN_LOG_EVERY = 300.0
 STATS_INTERVAL = float(os.environ.get("EARC_STATS_INTERVAL", "60"))
 # Length of the crossfade across each drop, and how far over target the buffer
-# may grow before the debt payback trims it (see the docstring).
+# may grow before the trim in put() takes it back (see the docstring).
 XFADE_MS = float(os.environ.get("EARC_XFADE_MS", "20"))
 DROP_HYST_MS = float(os.environ.get("EARC_DROP_HYST_MS", "15"))
 
@@ -164,18 +164,33 @@ class Buffer:
             if len(self.data) > self.peak:
                 self.peak = len(self.data)
             target = int(PREFILL_MS / 1000.0 * BYTES_PER_SEC)
-            # Pay back inserted silence. Every chunk of silence we hand pw-cat
-            # while starved is audio time we spent without consuming the buffer,
-            # so when data returns the buffer holds that much extra -- pure added
-            # latency that nothing else removes (seen settling at ~480 ms after a
-            # few link bounces). Give it back now, while the glitch that caused it
-            # is still the dominant artefact, instead of carrying it for hours.
+            # Trim the buffer back to target whenever it is hyst over it. This
+            # is the one rule that keeps latency fixed, and it answers two
+            # things that both push the buffer up and that nothing else takes
+            # back down:
+            #
+            #   * Inserted silence. Every chunk of silence we hand the sink
+            #     while starved is audio time we spent without consuming the
+            #     buffer, so when data returns the buffer holds that much extra
+            #     (seen settling at ~480 ms after a few link bounces). Giving it
+            #     back now means the glitch that caused it is still the dominant
+            #     artefact, instead of carrying the latency for hours.
+            #   * Clock drift, which is the steady one: ~160 ppm against the
+            #     UMC404HD, ~10 ms a minute, forever. This used to be gated on
+            #     self.debt, so the trim only ran while there was inserted
+            #     silence left to repay -- a finite pot. On 2026-10-24 the pot
+            #     ran out 2h50m in and the buffer then climbed 73 -> 401 ms in
+            #     35 minutes, pure added lip sync lag, until the MAX_MS ceiling
+            #     below would have cut it all back in one audible jump.
+            #
+            # debt is still tracked so a drop that happens to coincide with a
+            # repayment is not counted twice.
             hyst = int(DROP_HYST_MS / 1000.0 * BYTES_PER_SEC)
-            if self.debt and len(self.data) > target + hyst:
-                give = min(self.debt, len(self.data) - target) // FRAME * FRAME
+            if len(self.data) > target + hyst:
+                give = (len(self.data) - target) // FRAME * FRAME
                 if give:
                     self.drop(give)
-                    self.debt -= give
+                    self.debt = max(0, self.debt - give)
             ceiling = MAX_MS / 1000.0 * BYTES_PER_SEC
             if len(self.data) > ceiling:
                 excess = (len(self.data) - target) // FRAME * FRAME
