@@ -55,6 +55,37 @@ WS_TIMEOUT = float(os.environ.get("EARC_VOL_WS_TIMEOUT", "2"))
 _ws = None
 _ws_lock = threading.Lock()
 
+# earc-play gates the CamillaDSP pipeline down whenever the TV is off
+# (khadas/bin/earc-play.sh, IDLE GATING), so a refused websocket is the normal resting
+# state, not a fault. Without this the OLED's 4 Hz poll turned every one of
+# those into three log lines -- 484 of them in five minutes, measured
+# 2026-10-28, which is the same journal flood the OLED crash loop had just
+# been cured of. Back off instead, and log once per outage.
+DOWN_COOLDOWN = 5.0
+_down_until = 0.0
+_down_logged = False
+
+# The OLED polls `get` at 4 Hz (khadas/lib/earc-oled.py). Logging every answer
+# put 37121 identical "get -> 72 0" lines in the journal in one day and grew it
+# back from 328 MB to 408 MB, measured 2026-10-29. A poll is only worth a line
+# when the answer changed; real volume commands always get one.
+POLL_CMDS = ("get", "status")
+_last_poll_reply = None
+
+
+class DspDown(Exception):
+    """CamillaDSP is not listening. Expected while the pipeline is gated."""
+
+
+def poll_is_repeat(line, reply):
+    """True when this is a status poll whose answer has not changed."""
+    global _last_poll_reply
+    if line.split()[0].lower() not in POLL_CMDS:
+        return False
+    repeat = reply == _last_poll_reply
+    _last_poll_reply = reply
+    return repeat
+
 
 def log(msg):
     print("%s earc-volume: %s" % (time.strftime("%H:%M:%S"), msg),
@@ -73,13 +104,19 @@ def cec_to_db(value):
 
 def _command(payload, expect):
     """Send one websocket command, reconnecting once if the link went away."""
-    global _ws
+    global _ws, _down_until, _down_logged
     import json
+
+    if time.monotonic() < _down_until:
+        raise DspDown()
 
     for attempt in (1, 2):
         try:
             if _ws is None:
                 _ws = websocket.create_connection(CAMILLA_URL, timeout=WS_TIMEOUT)
+                if _down_logged:
+                    log("camilladsp websocket back")
+                    _down_logged = False
             _ws.send(payload)
             reply = json.loads(_ws.recv())[expect]
             if reply.get("result") != "Ok":
@@ -93,8 +130,14 @@ def _command(payload, expect):
                 pass
             _ws = None
             if attempt == 2:
-                raise
-            log("websocket lost (%s), reconnecting" % exc)
+                _down_until = time.monotonic() + DOWN_COOLDOWN
+                if not _down_logged:
+                    log("camilladsp websocket down (%s), quiet until it is back"
+                        % exc)
+                    _down_logged = True
+                raise DspDown()
+            if not _down_logged:
+                log("websocket lost (%s), reconnecting" % exc)
     return None
 
 
@@ -148,8 +191,13 @@ class Handler(socketserver.StreamRequestHandler):
                 line = raw.decode("utf-8", "replace").strip()
                 if not line:
                     continue
+                quiet = False
                 try:
                     reply = handle(line)
+                except DspDown:
+                    # Already logged once for this outage; the caller just
+                    # needs the ERR so the OLED can stay dark.
+                    reply, quiet = "ERR", True
                 except Exception as exc:
                     log("%r failed: %s" % (line, exc))
                     reply = "ERR"
@@ -157,7 +205,10 @@ class Handler(socketserver.StreamRequestHandler):
                     continue
                 self.wfile.write((reply + "\n").encode())
                 self.wfile.flush()
-                log("%s -> %s" % (line, reply))
+                if not quiet and poll_is_repeat(line, reply):
+                    quiet = True
+                if not quiet:
+                    log("%s -> %s" % (line, reply))
         except (socket.timeout, ConnectionResetError, BrokenPipeError):
             pass
         log("closed %s" % peer)
