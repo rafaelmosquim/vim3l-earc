@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Always-on eARC capture -> network streamer for the Khadas VIM3L.
 
-Captures whatever the TV sends over eARC (hw:0,5), follows format changes
+Captures whatever the TV sends over eARC (device 5 of the Amlogic card), follows format changes
 (stereo/multichannel LPCM at any rate, AC-3, E-AC-3) and serves ONE fixed,
 continuous stream to TCP clients:
 
@@ -24,7 +24,13 @@ import sys
 import threading
 import time
 
-DEV = "hw:0,5"
+# The Amlogic card is NOT reliably index 0. With the UMC404HD present at
+# boot the USB card can take index 0 (seen 2026-10-24: every card-index 0
+# reference then addressed the UMC, which silently broke capture, the CEC
+# daemon's link read and the latency hold). Address it by card id, which
+# never moves.
+CARD = os.environ.get("EARC_CARD", "AMLAUGESOUND")
+DEV = os.environ.get("EARC_DEV", f"hw:CARD={CARD},5")
 OUT_RATE, OUT_CH = 48000, 6
 FRAME = 2 * OUT_CH
 HERE = os.path.dirname(os.path.realpath(__file__))
@@ -42,14 +48,18 @@ AREC_BUF = ["-B", "60000", "-F", "10000"]  # 60 ms buffer, 10 ms periods
 # into the board and the eARC link was flapping, and since they were unplugged
 # there have been zero decoder errors across every E-AC-3 session. If
 # "error decoding the audio block" ever comes back, this is the first suspect.
-AREC_BUF_BITSTREAM = ["-B", "250000", "-F", "10000"]  # 250 ms buffer, 10 ms periods
+# Period 2.5 ms since 2026-11-15: a burst is only emitted once the arecord
+# period holding its end has been read, so 10 ms periods put up to ~10 ms of
+# jitter on every 32 ms DD+ frame (measured: decoder output 11 ms peak-to-peak
+# at 10 ms, ~5 ms at 2.5 ms, same 250 ms depth, no decode errors).
+AREC_BUF_BITSTREAM = ["-B", "250000", "-F", "2500"]  # 250 ms buffer, 2.5 ms periods
 FF_LOWLAT = ["-hide_banner", "-loglevel", "error", "-nostdin",
              "-fflags", "nobuffer", "-flags", "low_delay",
              "-probesize", "32", "-analyzeduration", "0"]
 FF_OUT = ["-ar", str(OUT_RATE), "-c:a", "pcm_s16le", "-f", "s16le",
           "-flush_packets", "1", "pipe:1"]
 
-# eARC_RX Audio Coding Type values (see `amixer -c0 cget name='eARC_RX Audio Coding Type'`)
+# eARC_RX Audio Coding Type values (see `amixer -c AMLAUGESOUND cget name='eARC_RX Audio Coding Type'`)
 LPCM2 = {1, 2}
 LPCM8 = {3}
 AC3 = {7, 8}
@@ -60,14 +70,115 @@ def log(*a):
     print(time.strftime("%H:%M:%S"), *a, flush=True)
 
 
-def ctl(name):
-    out = subprocess.run(["amixer", "-c0", "cget", f"name={name}"],
+class _Ctl:
+    """Read mixer controls in-process through libasound.
+
+    The old ctl() ran `amixer cget` in a subprocess: ~15 ms each on this board
+    (measured 2026-11-15), and the main loop reads two of them every 250 ms
+    for the format check. The loop is also the one forwarding audio, so each
+    check held decoded frames back ~30 ms -- at the receiver that showed up as
+    40-52 ms gaps between 32 ms DD+ frames followed by catch-up bursts, ~31 ms
+    of arrival jitter that its buffer had to absorb. A direct snd_ctl read
+    takes well under a millisecond. Like amixer, it only touches the control
+    device, never the PCM, so it cannot toggle the eARC RX.
+
+    Anything unexpected (no libasound, unknown control, a read error) falls
+    back to the amixer subprocess for that call, so behaviour degrades to the
+    old timing rather than to wrong values.
+    """
+    IFACE_MIXER = 2
+    T_BOOLEAN, T_INTEGER, T_ENUMERATED = 1, 2, 3
+
+    def __init__(self, card):
+        self.card = card
+        self.lib = None
+        self.handle = None
+        self.elems = {}
+        try:
+            import ctypes
+            self.ct = ctypes
+            lib = ctypes.CDLL("libasound.so.2")
+            vp = ctypes.c_void_p
+            for fn in ("snd_ctl_elem_id_malloc", "snd_ctl_elem_value_malloc",
+                       "snd_ctl_elem_info_malloc"):
+                getattr(lib, fn).argtypes = [ctypes.POINTER(vp)]
+            lib.snd_ctl_open.argtypes = [ctypes.POINTER(vp), ctypes.c_char_p, ctypes.c_int]
+            lib.snd_ctl_elem_id_set_interface.argtypes = [vp, ctypes.c_int]
+            lib.snd_ctl_elem_id_set_name.argtypes = [vp, ctypes.c_char_p]
+            lib.snd_ctl_elem_value_set_id.argtypes = [vp, vp]
+            lib.snd_ctl_elem_info_set_id.argtypes = [vp, vp]
+            lib.snd_ctl_elem_info.argtypes = [vp, vp]
+            lib.snd_ctl_elem_info_get_type.argtypes = [vp]
+            lib.snd_ctl_elem_read.argtypes = [vp, vp]
+            lib.snd_ctl_elem_value_get_integer.argtypes = [vp, ctypes.c_uint]
+            lib.snd_ctl_elem_value_get_integer.restype = ctypes.c_long
+            lib.snd_ctl_elem_value_get_enumerated.argtypes = [vp, ctypes.c_uint]
+            lib.snd_ctl_elem_value_get_enumerated.restype = ctypes.c_uint
+            lib.snd_ctl_elem_value_get_boolean.argtypes = [vp, ctypes.c_uint]
+            h = vp()
+            if lib.snd_ctl_open(ctypes.byref(h), f"hw:{card}".encode(), 0) < 0:
+                return
+            self.lib, self.handle = lib, h
+        except Exception:
+            self.lib = None
+
+    def _elem(self, name):
+        e = self.elems.get(name)
+        if e is not None:
+            return e
+        ct, lib = self.ct, self.lib
+        eid, val, info = ct.c_void_p(), ct.c_void_p(), ct.c_void_p()
+        if (lib.snd_ctl_elem_id_malloc(ct.byref(eid)) < 0
+                or lib.snd_ctl_elem_value_malloc(ct.byref(val)) < 0
+                or lib.snd_ctl_elem_info_malloc(ct.byref(info)) < 0):
+            return None
+        lib.snd_ctl_elem_id_set_interface(eid, self.IFACE_MIXER)
+        lib.snd_ctl_elem_id_set_name(eid, name.encode())
+        lib.snd_ctl_elem_info_set_id(info, eid)
+        if lib.snd_ctl_elem_info(self.handle, info) < 0:
+            return None
+        etype = lib.snd_ctl_elem_info_get_type(info)
+        if etype not in (self.T_BOOLEAN, self.T_INTEGER, self.T_ENUMERATED):
+            return None
+        lib.snd_ctl_elem_value_set_id(val, eid)
+        e = self.elems[name] = (val, etype, eid, info)  # keep all alive
+        return e
+
+    def get(self, name):
+        if self.lib is not None:
+            try:
+                e = self._elem(name)
+                if e is not None:
+                    val, etype = e[0], e[1]
+                    if self.lib.snd_ctl_elem_read(self.handle, val) >= 0:
+                        if etype == self.T_ENUMERATED:
+                            return int(self.lib.snd_ctl_elem_value_get_enumerated(val, 0))
+                        if etype == self.T_BOOLEAN:
+                            return int(self.lib.snd_ctl_elem_value_get_boolean(val, 0))
+                        return int(self.lib.snd_ctl_elem_value_get_integer(val, 0))
+            except Exception:
+                pass
+        return _amixer_get(name)
+
+
+def _amixer_get(name):
+    out = subprocess.run(["amixer", "-c", CARD, "cget", f"name={name}"],
                          capture_output=True, text=True).stdout
     for line in out.splitlines():
         if ": values=" in line:
             v = line.split("=", 1)[1].split(",")[0]
             return int(v, 0)
     return 0
+
+
+_CTL = None
+
+
+def ctl(name):
+    global _CTL
+    if _CTL is None:
+        _CTL = _Ctl(CARD)
+    return _CTL.get(name)
 
 
 def stream_format():
