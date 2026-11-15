@@ -1,0 +1,19 @@
+[Unit]
+Description=TV eARC 5.1 -> CamillaDSP -> UMC404HD (board-side playback)
+# A system unit, like the board's other three, rather than the user unit the
+# ProDesk used: with PipeWire gone there is no session to belong to, and this
+# way it does not depend on lingering and can hold a negative nice.
+After=earc-streamer.service sound.target
+Wants=earc-streamer.service
+
+[Service]
+Type=simple
+User=khadas
+Group=audio
+ExecStart=/usr/local/bin/earc-play.sh
+Restart=always
+RestartSec=3
+Nice=-10
+
+[Install]
+WantedBy=multi-user.target

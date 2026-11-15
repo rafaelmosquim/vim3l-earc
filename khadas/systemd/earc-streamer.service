@@ -1,7 +1,12 @@
 [Unit]
 Description=eARC capture -> TCP stream (5.1 s16le 48 kHz, port 4010)
-After=earc-cec.service network-online.target sound.target
-Wants=earc-cec.service network-online.target
+# No network-online: since the DSP moved onto this board the whole chain is
+# local (earc-recv connects to 127.0.0.1:4010), so waiting on the network
+# only delays audio -- and on wireless-only that wait is WPA association
+# plus DHCP, or a full NetworkManager-wait-online timeout if the AP is
+# down at boot. The TCP listener needs no carrier to bind.
+After=earc-cec.service sound.target
+Wants=earc-cec.service
 
 [Service]
 User=khadas

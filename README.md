@@ -59,9 +59,16 @@ The headline ones, before you buy a board for this:
 * A PC for the DSP end. The receiver there wants `numpy` (it degrades to plain
   cuts instead of fades without it) and PipeWire.
 
-Note the capture device is **`hw:0,5`** on this image. Khadas' own documentation
-says `hw:0,6`; on this image device 6 is a loopback. That detail costs people an
-afternoon.
+Note the capture device is **device 5** on this image, not 6. Khadas' own
+documentation says `hw:0,6`; here device 6 is a loopback. That detail costs
+people an afternoon.
+
+Address it as **`hw:CARD=AMLAUGESOUND,5`**, never `hw:0,5`. The Amlogic card is
+only index 0 while nothing else claims it: plug a USB interface in before boot
+and it can take 0, at which point every `-c0` silently addresses the wrong card
+-- capture fails, the CEC daemon reads the eARC link state as 0 and drops to
+legacy ARC, and the latency hold writes nothing. The scripts take `EARC_CARD`
+(default `AMLAUGESOUND`) for exactly this reason.
 
 ## Install
 
@@ -70,8 +77,17 @@ Board side:
 ```sh
 git clone https://github.com/rafaelmosquim/vim3l-earc
 cd vim3l-earc
-sudo bash install.sh              # or --no-oled
+sudo bash install.sh              # or --no-oled, --no-play
 ```
+
+That installs both halves on the board: capture plus a local DSP chain
+(`earc-recv.py` -> CamillaDSP -> a USB interface). It does not install
+CamillaDSP itself or a DSP config, and it says so if either is missing.
+
+Pass `--no-play` for the original split topology, where the board only captures
+and streams and a separate PC does the DSP. The two `local-dsp` drop-ins follow
+that choice: they point CEC volume at `127.0.0.1`, which is only right when the
+DSP runs on the board, so `--no-play` removes them.
 
 PC side, **without** sudo (they are user services, they need the session's
 PipeWire):
@@ -94,9 +110,13 @@ three places:
 
 | File | Line | What |
 |------|------|------|
-| `khadas/bin/earc-cec-daemon.py` | 61 | `HTPC_HOSTS` — where to forward CEC volume keys |
-| `khadas/bin/earc-cec-daemon.py` | 95 | `KODI_HOST` — where to forward CEC nav keys |
-| `khadas/lib/earc-oled.py` | 20 | `HTPC_HOSTS` — where the OLED reads the volume from |
+| `khadas/bin/earc-cec-daemon.py` | 70 | `HTPC_HOSTS` — where to forward CEC volume keys (env: `EARC_VOL_HOSTS`) |
+| `khadas/bin/earc-cec-daemon.py` | 105 | `KODI_HOST` — where to forward CEC nav keys |
+| `khadas/lib/earc-oled.py` | 21 | `HTPC_HOSTS` — where the OLED reads the volume from (env: `EARC_VOL_HOSTS`) |
+
+The two `HTPC_HOSTS` both read `EARC_VOL_HOSTS` from the environment, so for a
+board-side DSP there is nothing to edit — that is what the `local-dsp` drop-ins
+set. Only `KODI_HOST` is a true source edit.
 
 Also in `earc-cec-daemon.py`: `KODI_PA` is the physical address of the HDMI port
 your media player is on (`0x40,0x00` = HDMI 4). The PC side already reads its
@@ -113,12 +133,17 @@ khadas/lib/earc-streamer.py     the main service: capture, format following,
 khadas/lib/iec61937-extract.py  IEC 61937 burst unwrapper (AC-3 / E-AC-3) -> ES
 khadas/lib/earc-oled.py         volume on an SSD1306, lit only while it moves
 khadas/lib/ssd1306.py           minimal I2C panel driver, no dependencies
-khadas/systemd/                 the three units
+khadas/bin/earc-latency-watch.py  holds eARC_RX Latency per format (lip sync)
+khadas/bin/earc-play.sh         board-side playback: earc-recv -> CamillaDSP ->
+                                USB interface, no PipeWire in the path
+khadas/systemd/                 six units and three drop-ins
 
 htpc/bin/earc-recv.py           jitter-buffered receiver; a plain socat|pw-cat
-                                crackles, and the docstring says why
+                                crackles, and the docstring says why. SHARED:
+                                the board-side install takes it from here too
 htpc/bin/earc-in.sh             receiver -> pw-cat -> CamillaDSP sink
-htpc/bin/earc-volume.py         CEC volume -> CamillaDSP main fader, TCP 4011
+htpc/bin/earc-volume.py         CEC volume -> CamillaDSP main fader, TCP 4011;
+                                SHARED with the board-side install as well
 htpc/bin/earc-fix               my own deploy helper; needs an interactive sudo
 htpc/systemd/                   user units and the latency drop-in
 

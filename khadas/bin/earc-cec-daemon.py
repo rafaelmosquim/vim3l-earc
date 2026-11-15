@@ -58,8 +58,18 @@ last_earc = time.monotonic()
 # The HTPC owns the volume (step size and the 0-100 <-> dB mapping live there).
 # Line protocol over a kept-open TCP connection: "up"/"down"/"mute"/"mute 0|1"/
 # "set <0-100>"/"get" -> "<0-100> <0|1>", or "ERR".
-HTPC_HOSTS = ["192.168.15.134", "rafael-server.local"]   # IP first, avahi as fallback
-HTPC_PORT = 4011
+# Where the volume bridge listens. Env-overridable because the DSP end moves:
+# when CamillaDSP runs on the board itself this becomes 127.0.0.1, and making
+# that a drop-in rather than an edit keeps the rollback to deleting the drop-in.
+# Mixer card id, not an index: with the UMC404HD plugged in at boot the USB
+# card can take index 0, and addressing card 0 then reads the wrong card
+# entirely -- attended type comes back 0 and this daemon drops to legacy
+# ARC for nothing (seen 2026-10-24).
+CARD = os.environ.get("EARC_CARD", "AMLAUGESOUND")
+
+HTPC_HOSTS = [h for h in os.environ.get(
+    "EARC_VOL_HOSTS", "192.168.15.134,rafael-server.local").split(",") if h]
+HTPC_PORT = int(os.environ.get("EARC_VOL_PORT", "4011"))
 HTPC_CONNECT_TIMEOUT = 0.4
 HTPC_REPLY_TIMEOUT = 0.2     # drop the command rather than lag behind the keys
 HTPC_RETRY_AFTER = 5.0       # don't retry a dead HTPC on every repeated key
@@ -124,7 +134,7 @@ key_q = queue.Queue(KEY_QUEUE_MAX)
 
 def attended():
     """eARC RX link state: 0 DISCONNECT, 1 ARC, 2 eARC."""
-    out = subprocess.run(["amixer", "-c0", "cget", "name=eARC_RX attended type"],
+    out = subprocess.run(["amixer", "-c", CARD, "cget", "name=eARC_RX attended type"],
                          capture_output=True, text=True).stdout
     for line in out.splitlines():
         if ": values=" in line:
@@ -177,9 +187,9 @@ def setup():
     # second address has to be added after it, never before.
     wr("dbg", f"addbaddr {KODI_LA}")
     cds = ",".join(f"0x{x:02x}" for x in CDS + [0] * (256 - len(CDS)))
-    subprocess.run(["amixer", "-q", "-c0", "cset", "name=eARC_RX CDS", cds], check=False)
-    subprocess.run(["amixer", "-q", "-c0", "cset", "name=ARC eARC RX enable", "on"], check=False)
-    subprocess.run(["amixer", "-q", "-c0", "cset", "name=eARC RX ARC Switch", "on"], check=False)
+    subprocess.run(["amixer", "-q", "-c", CARD, "cset", "name=eARC_RX CDS", cds], check=False)
+    subprocess.run(["amixer", "-q", "-c", CARD, "cset", "name=ARC eARC RX enable", "on"], check=False)
+    subprocess.run(["amixer", "-q", "-c", CARD, "cset", "name=eARC RX ARC Switch", "on"], check=False)
     hi, lo = phys_addr()
     bcast(0x84, hi, lo, 0x05)              # Report Physical Address
     bcast(0x72, 0x01 if system_audio else 0x00)  # Set System Audio Mode

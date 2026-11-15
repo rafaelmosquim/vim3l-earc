@@ -1,0 +1,18 @@
+[Unit]
+Description=CEC volume keys -> CamillaDSP main fader (TCP 4011)
+# Board-side copy of htpc/systemd/earc-volume.service, as a system unit. The
+# CEC daemon reaches it on 127.0.0.1 now; earc-volume.py's EARC_VOL_ALLOWED
+# already permits localhost, so nothing in it had to change.
+After=earc-play.service
+Wants=earc-play.service
+
+[Service]
+Type=simple
+User=khadas
+Group=audio
+ExecStart=/usr/bin/python3 /usr/local/bin/earc-volume.py
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

@@ -17,8 +17,10 @@ import ssd1306
 FONT = "/usr/share/consolefonts/Lat15-Terminus32x16.psf.gz"   # 16x32
 MAX_SCALE = 3     # beyond this the blocks get coarse enough to look ragged
 
-HTPC_HOSTS = ["192.168.15.134", "rafael-server.local"]
-HTPC_PORT = 4011
+# Same env override as the CEC daemon: see its comment.
+HTPC_HOSTS = [h for h in os.environ.get(
+    "EARC_VOL_HOSTS", "192.168.15.134,rafael-server.local").split(",") if h]
+HTPC_PORT = int(os.environ.get("EARC_VOL_PORT", "4011"))
 CONNECT_TIMEOUT = 0.4
 REPLY_TIMEOUT = 0.3
 RETRY_AFTER = 5.0
