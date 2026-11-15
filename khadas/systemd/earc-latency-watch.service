@@ -1,0 +1,24 @@
+[Unit]
+Description=Hold eARC_RX Latency at a per-format value (lip sync)
+# Needs earc-streamer: the format registers read zero unless a capture is open,
+# so without it there is no coding type to decide on.
+After=earc-streamer.service
+Wants=earc-streamer.service
+
+[Service]
+Type=simple
+User=khadas
+Group=audio
+# BOTH at 0, which is exactly the state judged good by ear on 2026-10-24
+# (bitstream under 50 ms late, and LPCM is ~64 ms shorter through the same
+# chain, so it should land near sync). Do NOT put LPCM at the driver's 100
+# "to leave it alone": a higher register means MORE audio lag, so that would
+# make LPCM ~86 ms late. If LPCM turns out to be EARLY, raise this.
+Environment=EARC_LAT_BITSTREAM=0
+Environment=EARC_LAT_LPCM=0
+ExecStart=/usr/bin/python3 /usr/local/bin/earc-latency-watch.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
