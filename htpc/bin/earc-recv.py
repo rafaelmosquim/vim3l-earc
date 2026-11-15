@@ -62,6 +62,14 @@ STATS_INTERVAL = float(os.environ.get("EARC_STATS_INTERVAL", "60"))
 # may grow before the trim in put() takes it back (see the docstring).
 XFADE_MS = float(os.environ.get("EARC_XFADE_MS", "20"))
 DROP_HYST_MS = float(os.environ.get("EARC_DROP_HYST_MS", "15"))
+# Capacity of the pipe on stdout. take() never blocks -- it hands out audio or
+# silence at once -- so whatever pipe sits between us and the consumer is kept
+# permanently FULL, and its whole capacity is added latency. Linux defaults to
+# 64 KiB, which at 6 ch s16 48 kHz is ~114 ms on top of PREFILL_MS (found
+# 2026-11-15; nothing had measured it). 8192 B is ~14 ms; the kernel rounds up
+# to a power-of-two number of pages and never goes below one page (4096 B,
+# ~7 ms). 0 leaves the pipe alone.
+PIPE_BYTES = int(os.environ.get("EARC_PIPE_BYTES", "8192"))
 
 FRAME = CHANNELS * SAMPLE_BYTES
 BYTES_PER_SEC = RATE * FRAME
@@ -138,6 +146,10 @@ class Buffer:
         self.dropped_bytes = 0
         self.debt = 0  # silence we inserted and owe back, see put()
         self.peak = 0
+        # Lowest level seen right after a take() since the last stats line: the
+        # real safety margin, i.e. how much of PREFILL_MS is never touched.
+        # None until the first take() of real audio in the interval.
+        self.low = None
         self.muted = True  # True when the last thing handed out was silence
         self.last = b""    # final frame of real audio, to decay out of
 
@@ -216,9 +228,12 @@ class Buffer:
                 self.underrun_bytes += WRITE_BYTES
                 self.debt += WRITE_BYTES
                 self.priming = True
+                self.low = 0
                 return self._mute()
             chunk = bytes(self.data[:n])
             del self.data[:n]
+            if self.low is None or len(self.data) < self.low:
+                self.low = len(self.data)
             if self.muted:
                 # Data is back: ramp up from zero instead of stepping to it.
                 chunk = _fade(chunk, MUTE_IN)
@@ -301,7 +316,25 @@ def reader(buf):
         time.sleep(RETRY_DELAY)
 
 
+def shrink_stdout_pipe():
+    """Cap the stdout pipe at PIPE_BYTES; see the comment where it is set."""
+    if PIPE_BYTES <= 0:
+        return
+    try:
+        import fcntl
+        setsz = getattr(fcntl, "F_SETPIPE_SZ", 1031)
+        getsz = getattr(fcntl, "F_GETPIPE_SZ", 1032)
+        fd = sys.stdout.fileno()
+        old = fcntl.fcntl(fd, getsz)
+        new = fcntl.fcntl(fd, setsz, PIPE_BYTES)
+        log("stdout pipe %d -> %d bytes (%.1f ms -> %.1f ms)"
+            % (old, new, ms(old), ms(new)))
+    except OSError as exc:  # not a pipe (tty, file), or the kernel refused
+        log("stdout pipe left as is: %s" % exc)
+
+
 def main():
+    shrink_stdout_pipe()
     buf = Buffer()
     threading.Thread(target=reader, args=(buf,), daemon=True).start()
     out = sys.stdout.buffer
@@ -313,13 +346,17 @@ def main():
         now = time.monotonic()
         if now - last_stats >= STATS_INTERVAL:
             with buf.lock:
-                level, under, dropped, reconnects, peak = (
-                    len(buf.data), buf.underrun_bytes, buf.dropped_bytes, buf.reconnects, buf.peak)
+                level, under, dropped, reconnects, peak, low = (
+                    len(buf.data), buf.underrun_bytes, buf.dropped_bytes, buf.reconnects, buf.peak,
+                    buf.low)
                 buf.peak = level
+                buf.low = None
             du, dd, dr = under - base[0], dropped - base[1], reconnects - base[2]
             base = (under, dropped, reconnects)
-            log("buffer %.0fms (peak %.0fms) | last %.0fs: silence inserted %.0fms, "
-                "dropped %.0fms, reconnects %d" % (ms(level), ms(peak), now - last_stats, ms(du), ms(dd), dr))
+            low_s = "-" if low is None else "%.0fms" % ms(low)
+            log("buffer %.0fms (low %s, peak %.0fms) | last %.0fs: silence inserted %.0fms, "
+                "dropped %.0fms, reconnects %d"
+                % (ms(level), low_s, ms(peak), now - last_stats, ms(du), ms(dd), dr))
             last_stats = now
 
 
