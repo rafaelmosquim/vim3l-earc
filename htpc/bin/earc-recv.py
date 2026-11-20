@@ -70,6 +70,18 @@ DROP_HYST_MS = float(os.environ.get("EARC_DROP_HYST_MS", "15"))
 # to a power-of-two number of pages and never goes below one page (4096 B,
 # ~7 ms). 0 leaves the pipe alone.
 PIPE_BYTES = int(os.environ.get("EARC_PIPE_BYTES", "8192"))
+# Pace writes by what is actually IN the pipe instead of by its capacity. The
+# capacity is counted in whole pages, so on a kernel with 16 KiB pages (the Pi 5)
+# the smallest pipe is one 16 KiB slot: it fills with five 2880 B writes, and a
+# write cannot go into a second page until the reader has drained ALL of the
+# first. The writer then sat blocked for ~25 ms and took five chunks at once,
+# emptying the jitter buffer in one gulp: 90-120 ms of inserted silence a minute
+# at PREFILL 55 (measured 2026-11-15, network jitter only 5.8 ms). With this set,
+# the loop waits until FIONREAD shows at most this much queued, so the pipe holds
+# PIPE_FILL_MS + one write and never blocks. Give it more than one page of
+# capacity (EARC_PIPE_BYTES >= 2 pages) so a write always has a slot.
+# 0 = off: rely on the pipe's backpressure (fine with 4 KiB pages).
+PIPE_FILL_MS = float(os.environ.get("EARC_PIPE_FILL_MS", "0"))
 
 FRAME = CHANNELS * SAMPLE_BYTES
 BYTES_PER_SEC = RATE * FRAME
@@ -109,6 +121,198 @@ if np is not None and SAMPLE_BYTES == 2:
 else:
     MUTE_IN = MUTE_OUT = None
 
+
+
+# ---------------------------------------------------------------------------
+# Night mode: a Dolby-style dynamic range control (2026-11-15).
+#
+# What Dolby DRC does (DP569/DP570 manuals): the ENCODER measures the whole mix,
+# weighted to ignore deep bass, and writes one gain per block that the decoder
+# applies to ALL channels alike, so the front/surround balance never moves. The
+# gain follows a fixed curve anchored at the dialogue level (dialnorm): quiet
+# passages are boosted toward it, a null band around it is left alone, louder
+# material is cut, gently at first and then at 20:1. Line mode keeps dialogue at
+# its level; RF ("heavy") mode compresses harder.
+#
+# The TV re-encodes app audio to DD+ with dialnorm -31 ("no information") and
+# near-zero gain words, so the stream's own DRC does nothing here (measured
+# 2026-11-15: drc_scale 0 and 1 decode identically). This re-creates it after
+# the decoder instead. What it keeps from Dolby: the profile curves, one gain for
+# all six channels from a loudness measure of the whole mix (BS.1770 weights:
+# L/R/C 1.0, surrounds 1.41, LFE out; K-weighting applied in the FFT domain), and
+# lookahead -- the audio queued in this buffer is already here, so a cut can
+# start before the peak plays, at no extra latency. Curves are relative to
+# EARC_DRC_REF, the dialogue loudness this stream actually has (no real dialnorm
+# to read); the stats line logs the measured loudness to set it by.
+#
+# Profiles (dB relative to REF; Dolby's tables are quoted for dialnorm -31):
+#   film_standard  boost up to +6 (2:1 from -12), null 0..+5, 2:1 to +15, then 20:1
+#   film_light     boost up to +6 (2:1 from -22 to -10), null -10..+10, 2:1 to +20, 20:1
+#   music_light    boost up to +12 (2:1 below -10), null -10..+10, 2:1 above
+#   night          NOT a Dolby table: harder, for late night. +9 boost (2:1 below
+#                  0), null 0..+3, 3:1 to +10, then 20:1
+# Select with EARC_DRC, or live by writing the profile name into EARC_DRC_FILE
+# (checked once a second; a missing file means EARC_DRC). "off" bypasses it.
+DRC_PROFILES = {
+    #               boost_max boost_ratio null_lo null_hi early_hi early_ratio cut_ratio
+    "film_standard": (6.0, 2.0, 0.0, 5.0, 15.0, 2.0, 20.0),
+    "film_light":    (6.0, 2.0, -10.0, 10.0, 20.0, 2.0, 20.0),
+    "music_light":   (12.0, 2.0, -10.0, 10.0, 10.0, 2.0, 2.0),
+    "night":         (9.0, 2.0, 0.0, 3.0, 10.0, 3.0, 20.0),
+}
+DRC_DEFAULT = os.environ.get("EARC_DRC", "off").strip().lower()
+DRC_FILE = os.path.expanduser(os.environ.get("EARC_DRC_FILE", "~/.config/earc/drc"))
+DRC_REF = float(os.environ.get("EARC_DRC_REF", "-27"))
+DRC_LOOKAHEAD_MS = float(os.environ.get("EARC_DRC_LOOKAHEAD_MS", "20"))
+DRC_ATTACK_MS = float(os.environ.get("EARC_DRC_ATTACK_MS", "10"))
+DRC_RELEASE_MS = float(os.environ.get("EARC_DRC_RELEASE_MS", "1500"))
+DRC_SLOW_MS = float(os.environ.get("EARC_DRC_SLOW_MS", "400"))
+# BS.1770 channel weights in this stream's order, FL FR FC LFE SL SR.
+DRC_CH_WEIGHTS = (1.0, 1.0, 1.0, 0.0, 1.41, 1.41)
+
+
+def drc_curve(level, prof):
+    """Gain in dB the profile asks for at `level` dB relative to the reference."""
+    boost_max, boost_ratio, null_lo, null_hi, early_hi, early_ratio, cut_ratio = prof
+    if level < null_lo:
+        return min(boost_max, (null_lo - level) * (1.0 - 1.0 / boost_ratio))
+    if level <= null_hi:
+        return 0.0
+    if level <= early_hi:
+        return -(level - null_hi) * (1.0 - 1.0 / early_ratio)
+    return (-(early_hi - null_hi) * (1.0 - 1.0 / early_ratio)
+            - (level - early_hi) * (1.0 - 1.0 / cut_ratio))
+
+
+def _k_weight_power(n):
+    """|H(f)|^2 of the BS.1770 K-weighting (48 kHz biquads) at the rfft bins of an
+    n-sample block, with the Parseval factors folded in."""
+    w = np.pi * np.arange(n // 2 + 1) / (n / 2.0)
+    z1, z2 = np.exp(-1j * w), np.exp(-2j * w)
+    shelf = ((1.53512485958697 - 2.69169618940638 * z1 + 1.19839281085285 * z2)
+             / (1.0 - 1.69065929318241 * z1 + 0.73248077421585 * z2))
+    hpf = (1.0 - 2.0 * z1 + z2) / (1.0 - 1.99004745483398 * z1 + 0.99007225036621 * z2)
+    p = np.abs(shelf * hpf) ** 2
+    p[1:(n + 1) // 2] *= 2.0  # one-sided spectrum: count the mirrored bins
+    return (p / float(n * n)).astype(np.float32)
+
+
+class Drc:
+    BLOCK = 240  # = WRITE_FRAMES, 5 ms
+
+    def __init__(self):
+        self.ok = np is not None and SAMPLE_BYTES == 2 and CHANNELS == 6
+        self.profile = None
+        self.name = "off"
+        self.gain_db = 0.0
+        self.slow_p = None
+        self.reset_stats()
+        if not self.ok:
+            return
+        self.kw = _k_weight_power(self.BLOCK)[None, :, None]
+        self.chw = np.array(DRC_CH_WEIGHTS, dtype=np.float32)
+        blk_s = self.BLOCK / float(RATE)
+        self.a_att = 1.0 - np.exp(-blk_s / (DRC_ATTACK_MS / 1000.0))
+        self.a_rel = 1.0 - np.exp(-blk_s / (DRC_RELEASE_MS / 1000.0))
+        self.a_slow = 1.0 - np.exp(-blk_s / (DRC_SLOW_MS / 1000.0))
+        self.look_bytes = int(DRC_LOOKAHEAD_MS / 1000.0 * RATE) // self.BLOCK * self.BLOCK * FRAME
+        self.select(DRC_DEFAULT)
+
+    def select(self, name):
+        name = (name or "off").strip().lower()
+        if name == self.name:
+            return
+        if name != "off" and name not in DRC_PROFILES:
+            log("drc: unknown profile %r, keeping %s" % (name, self.name))
+            return
+        if name != "off" and not self.ok:
+            log("drc: needs numpy and 6ch s16; staying off")
+            return
+        self.name = name
+        self.profile = DRC_PROFILES.get(name)
+        log("drc: %s (ref %.1f LKFS)" % (name, DRC_REF))
+
+    def reset_stats(self):
+        self.st_n = 0
+        self.st_gsum = 0.0
+        self.st_gmin = None
+        self.st_gmax = None
+        self.st_psum = 0.0
+
+    def _powers(self, frames):
+        """K-weighted, channel-weighted mean-square power per 240-frame block."""
+        nb = len(frames) // self.BLOCK
+        if nb == 0:
+            return np.zeros(0, dtype=np.float32)
+        x = frames[:nb * self.BLOCK].reshape(nb, self.BLOCK, CHANNELS).astype(np.float32) / 32768.0
+        spec = np.fft.rfft(x, axis=1)
+        p = (spec.real ** 2 + spec.imag ** 2) * self.kw   # (nb, bins, ch)
+        return p.sum(axis=1) @ self.chw                     # (nb,)
+
+    def process(self, chunk, ahead):
+        """Apply the gain to `chunk` (s16le bytes); `ahead` is the audio queued
+        after it (lookahead). Returns new bytes."""
+        if self.profile is None:
+            if self.gain_db == 0.0:
+                return chunk
+            target = 0.0  # switched off: glide back to unity, then bypass
+            cur_p = None
+        else:
+            cur = np.frombuffer(chunk, dtype="<i2").reshape(-1, CHANNELS)
+            # The queue can end mid-frame (the socket delivers arbitrary byte
+            # counts), so only whole frames go into the lookahead.
+            nlook = min(self.look_bytes, len(ahead) // FRAME * FRAME)
+            look = np.frombuffer(bytes(ahead[:nlook]), dtype="<i2").reshape(-1, CHANNELS)
+            pc = self._powers(cur)
+            pl = self._powers(look)
+            if len(pc):
+                cur_p = float(pc.mean())
+            else:  # short chunk: unweighted fallback
+                cur_p = float(((cur.astype(np.float32) / 32768.0) ** 2 @ self.chw).mean())
+            self.slow_p = cur_p if self.slow_p is None else (
+                self.slow_p + self.a_slow * (cur_p - self.slow_p))
+            allp = np.concatenate([[cur_p], pl]) if len(pl) else np.array([cur_p])
+            if len(allp) > 1:  # ~10 ms detector: mean of neighbouring blocks
+                allp = 0.5 * (allp[1:] + allp[:-1])
+            fast_db = -0.691 + 10.0 * np.log10(max(float(allp.max()), 1e-12)) - DRC_REF
+            slow_db = -0.691 + 10.0 * np.log10(max(self.slow_p, 1e-12)) - DRC_REF
+            # Boost follows the slow level, so single words in a quiet scene do
+            # not pump it. The fast (lookahead) level only caps it: where the
+            # curve cuts, never exceed that cut; where it boosts, never push the
+            # fast level past the top of the null band.
+            g_fast = drc_curve(fast_db, self.profile)
+            cap = g_fast if g_fast <= 0.0 else max(g_fast, self.profile[3] - fast_db)
+            target = min(drc_curve(slow_db, self.profile), cap)
+        prev = self.gain_db
+        a = self.a_att if target < prev else self.a_rel
+        new = prev + a * (target - prev)
+        if self.profile is None and abs(new) < 0.05:
+            new = 0.0
+        self.gain_db = new
+        if cur_p is not None:
+            self.st_n += 1
+            self.st_gsum += new
+            self.st_psum += cur_p
+            self.st_gmin = new if self.st_gmin is None else min(self.st_gmin, new)
+            self.st_gmax = new if self.st_gmax is None else max(self.st_gmax, new)
+        if prev == 0.0 and new == 0.0:
+            return chunk
+        cur = np.frombuffer(chunk, dtype="<i2").reshape(-1, CHANNELS)
+        g0, g1 = 10.0 ** (prev / 20.0), 10.0 ** (new / 20.0)
+        ramp = np.linspace(g0, g1, len(cur), endpoint=False, dtype=np.float32)[:, None]
+        out = np.clip(np.rint(cur * ramp), -32768, 32767)
+        return out.astype("<i2").tobytes()
+
+    def stats(self):
+        """One-line summary since the last call, or None while off and idle."""
+        if self.st_n == 0:
+            s = None if self.name == "off" else "drc %s idle" % self.name
+        else:
+            loud = -0.691 + 10.0 * np.log10(max(self.st_psum / self.st_n, 1e-12))
+            s = ("drc %s: gain %+.1f/%+.1f/%+.1f dB (min/avg/max), loudness %.1f LKFS (ref %.1f)"
+                 % (self.name, self.st_gmin, self.st_gsum / self.st_n, self.st_gmax, loud, DRC_REF))
+        self.reset_stats()
+        return s
 
 def _fade(buf, gains):
     """s16le `buf` with its first len(gains) frames scaled by `gains`."""
@@ -152,6 +356,7 @@ class Buffer:
         self.low = None
         self.muted = True  # True when the last thing handed out was silence
         self.last = b""    # final frame of real audio, to decay out of
+        self.drc = Drc()
 
     def drop(self, nbytes):
         """Remove nbytes (whole frames) from the head of the buffer, which is the
@@ -234,6 +439,11 @@ class Buffer:
             del self.data[:n]
             if self.low is None or len(self.data) < self.low:
                 self.low = len(self.data)
+            try:
+                chunk = self.drc.process(chunk, self.data)
+            except Exception as exc:  # never let night mode take the audio down
+                log("drc: disabled after error: %r" % (exc,))
+                self.drc.profile, self.drc.name, self.drc.gain_db = None, "error", 0.0
             if self.muted:
                 # Data is back: ramp up from zero instead of stepping to it.
                 chunk = _fade(chunk, MUTE_IN)
@@ -333,17 +543,59 @@ def shrink_stdout_pipe():
         log("stdout pipe left as is: %s" % exc)
 
 
+def pipe_pacer():
+    """Return a wait() that holds the writer until the stdout pipe is down to
+    PIPE_FILL_MS, or None when pacing is off or stdout is not a pipe."""
+    if PIPE_FILL_MS <= 0:
+        return None
+    import array
+    import fcntl
+    import termios
+    fd = sys.stdout.fileno()
+    limit = int(PIPE_FILL_MS / 1000.0 * BYTES_PER_SEC)
+    queued = array.array("i", [0])
+    try:
+        fcntl.ioctl(fd, termios.FIONREAD, queued, True)
+    except OSError as exc:
+        log("pipe pacing off: %s" % exc)
+        return None
+    log("pipe pacing at %.1f ms (%d bytes)" % (PIPE_FILL_MS, limit))
+
+    def wait():
+        while True:
+            fcntl.ioctl(fd, termios.FIONREAD, queued, True)
+            excess = queued[0] - limit
+            if excess <= 0:
+                return
+            # Sleep about as long as the consumer needs to eat the excess.
+            time.sleep(max(0.0005, excess / BYTES_PER_SEC))
+    return wait
+
+
 def main():
     shrink_stdout_pipe()
+    pace = pipe_pacer()
     buf = Buffer()
     threading.Thread(target=reader, args=(buf,), daemon=True).start()
     out = sys.stdout.buffer
     last_stats = time.monotonic()
+    last_drc_check = 0.0
     base = (0, 0, 0)
     while True:
+        if pace is not None:
+            pace()
         out.write(buf.take())
         out.flush()
         now = time.monotonic()
+        if now - last_drc_check >= 1.0:
+            last_drc_check = now
+            try:
+                with open(DRC_FILE) as f:
+                    want = (f.read().split() or ["off"])[0]
+            except OSError:
+                want = DRC_DEFAULT
+            with buf.lock:
+                buf.drc.select(want)
         if now - last_stats >= STATS_INTERVAL:
             with buf.lock:
                 level, under, dropped, reconnects, peak, low = (
@@ -357,6 +609,10 @@ def main():
             log("buffer %.0fms (low %s, peak %.0fms) | last %.0fs: silence inserted %.0fms, "
                 "dropped %.0fms, reconnects %d"
                 % (ms(level), low_s, ms(peak), now - last_stats, ms(du), ms(dd), dr))
+            with buf.lock:
+                drc_line = buf.drc.stats()
+            if drc_line:
+                log(drc_line)
             last_stats = now
 
 

@@ -45,6 +45,10 @@ INITIAL_GAIN="${CDSP_INITIAL_GAIN:--20}"
 RETRY_DELAY="${EARC_RETRY_DELAY:-3}"
 RECV="${EARC_RECV:-/usr/local/bin/earc-recv.py}"
 CARD="${EARC_CARD:-AMLAUGESOUND}"
+# Set when the eARC receiver is another board (the Pi 5 setup): the gate reads
+# the link state from that board's earc-status.py instead of the local mixer.
+EARC_STATUS_HOST="${EARC_STATUS_HOST:-}"
+EARC_STATUS_PORT="${EARC_STATUS_PORT:-4012}"
 
 # How long the link must read "not eARC" before the pipeline is torn down.
 # Generous on purpose: a teardown costs a few seconds of catch-up on the way
@@ -71,19 +75,35 @@ set_min_freq() {
     done
 }
 
-attended() {
+attended_local() {
     amixer -c "$CARD" cget "name=eARC_RX attended type" 2>/dev/null \
         | sed -n 's/.*: values=\([0-9]*\).*/\1/p' | head -1
 }
 
+# On the Pi 5 the eARC receiver is another board, so its mixer is out of reach:
+# ask earc-status.py on the VIM3L instead (one line per connection, e.g.
+# "attended=2 type=9 rate=192000"). An unreachable VIM3L reads as empty, i.e.
+# "not eARC", so the pipeline idles down after IDLE_GRACE like a TV switched off.
+attended_remote() {
+    timeout 2 bash -c 'exec 3<>"/dev/tcp/$0/$1" && head -1 <&3' \
+        "$EARC_STATUS_HOST" "$EARC_STATUS_PORT" 2>/dev/null \
+        | sed -n 's/.*attended=\([0-9]*\).*/\1/p'
+}
+
+if [ -n "$EARC_STATUS_HOST" ]; then
+    attended() { attended_remote; }
+else
+    attended() { attended_local; }
+fi
+
 mkdir -p "$(dirname "$STATEFILE")"
 [ -r "$CONFIG" ] || { log "no config at $CONFIG"; exit 1; }
 [ -x "$CDSP" ]   || { log "no camilladsp at $CDSP"; exit 1; }
-log "mode $MODE, config $CONFIG, idle grace ${IDLE_GRACE}s"
+log "mode $MODE, config $CONFIG, idle grace ${IDLE_GRACE}s, link state from ${EARC_STATUS_HOST:-local mixer}"
 
 # The streamer is on this same board now. It is still a TCP server and
 # earc-recv.py still reconnects on its own, so nothing has to be ordered.
-export EARC_HOST="${EARC_HOST:-127.0.0.1}"
+export EARC_HOST="${EARC_HOST:-${EARC_STATUS_HOST:-127.0.0.1}}"
 
 cleanup() { set_min_freq "$FREQ_IDLE"; }
 trap cleanup EXIT
@@ -99,7 +119,14 @@ start_pipeline() {
     mkfifo -m 600 "$fifo" || return 1
     "$RECV" > "$fifo" &
     recv=$!
-    "$CDSP" -p "$PORT" -s "$STATEFILE" --gain="$INITIAL_GAIN" -l warn "$CONFIG" < "$fifo" &
+    # --gain OVERRIDES the statefile's volume on every start, not just the
+    # first (2026-11-15: each restart came up at -20 dB, and genelec-avr then
+    # "parked" the fader by moving those 20 dB onto the Genelecs -- every
+    # pipeline restart, TV off/on included, left the room 20 dB quieter). So pass
+    # it only until a statefile exists.
+    local gain=()
+    [ -s "$STATEFILE" ] || gain=(--gain="$INITIAL_GAIN")
+    "$CDSP" -p "$PORT" -s "$STATEFILE" "${gain[@]}" -l warn "$CONFIG" < "$fifo" &
     cdsp=$!
     rm -f "$fifo"   # both ends are open; the name is no longer needed
 }
