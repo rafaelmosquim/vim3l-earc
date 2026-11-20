@@ -27,6 +27,18 @@ discontinuity, heard as a click, so every drop is crossfaded over XFADE_MS from
 the audio before the cut into the audio after it, and the trim waits until the
 buffer is DROP_HYST_MS over target so it fires every minute or two (at UMC
 drift) rather than on every burst.
+
+ADAPTIVE RESAMPLING (2026-11-20, "fix 3"; EARC_RESAMPLE=1, the default). The
+drop above still skips 15-20 ms of real audio every couple of minutes, and on a
+held note or a film score that can be heard. Instead, take() now reads the
+buffer through a variable-ratio windowed-sinc interpolator and plays it
+continuously ~160 ppm faster than it arrives (0.016 %, far below hearing), with
+the ratio steered by a slow PI loop on the buffer's MEAN level. Nothing is cut:
+the steady drift never reaches the drop at all, and the level sits flat at
+EARC_RS_TARGET_MS instead of saw-toothing up by DROP_HYST_MS between trims. A
+crossfaded drop stays only as the catch-up for a sender lump after a stall
+(EARC_RS_COARSE_MS over target), and MAX_MS stays as the last resort.
+EARC_RESAMPLE=0 (or no numpy) restores the drop-only behaviour exactly.
 """
 import os
 import socket
@@ -82,6 +94,40 @@ PIPE_BYTES = int(os.environ.get("EARC_PIPE_BYTES", "8192"))
 # capacity (EARC_PIPE_BYTES >= 2 pages) so a write always has a slot.
 # 0 = off: rely on the pipe's backpressure (fine with 4 KiB pages).
 PIPE_FILL_MS = float(os.environ.get("EARC_PIPE_FILL_MS", "0"))
+
+# Adaptive resampling, see the docstring. The target is the MEAN fill, not the
+# post-burst peak the drop logic trims to: with drops the mean sat ~15 ms under
+# PREFILL_MS (55 -> ~40 measured 2026-11-20) and the lows came from the valleys
+# just after each trim. With a flat mean the low point is mean minus half the
+# sender's burst swing.
+RESAMPLE = os.environ.get("EARC_RESAMPLE", "1").strip().lower() not in ("0", "off", "no", "false")
+RS_TARGET_MS = float(os.environ.get("EARC_RS_TARGET_MS", "45"))
+# PI loop on the mean level. The plant is an integrator (1 ppm of ratio moves
+# the level 0.001 ms per second), so KP sets the loop's crossover (~0.05 rad/s,
+# a ~20 s time constant) and KI the integral zero a quarter of that below it.
+# The level is low-passed first (RS_LEVEL_TAU) so the sender's 30-70 ms burst
+# saw-tooth leaves only a few ppm of ripple on the ratio.
+RS_KP = float(os.environ.get("EARC_RS_KP", "50"))        # ppm per ms of error
+RS_KI = float(os.environ.get("EARC_RS_KI", "0.6"))       # ppm per ms per second
+RS_LEVEL_TAU = float(os.environ.get("EARC_RS_LEVEL_TAU", "2"))
+RS_MAX_PPM = float(os.environ.get("EARC_RS_MAX_PPM", "1000"))  # 1000 ppm = 1.7 cents
+# A sender lump after a stall (hundreds of ms at once) would take minutes to
+# play off at RS_MAX_PPM, so above target + COARSE the excess down to
+# target + COARSE/2 is dropped, crossfaded, like before.
+RS_COARSE_MS = float(os.environ.get("EARC_RS_COARSE_MS", "60"))
+# After a re-seed, hold the integrator until the mean is within RS_SETTLE_MS of
+# target or RS_SETTLE_S has passed (see _steer).
+RS_SETTLE_MS = 5.0
+RS_SETTLE_S = 20.0
+# The integrator's value is saved here once per stats line and seeds the next
+# start, so a restart begins at the learnt ~160 ppm instead of re-learning it.
+RS_STATE_FILE = os.path.expanduser(os.environ.get("EARC_RS_STATE", "~/.local/state/earc/rs-ppm"))
+# Interpolator: 2*RS_HALF taps, Kaiser-windowed sinc, coefficients tabulated at
+# RS_PHASES fractional positions and linearly interpolated between them.
+RS_HALF = int(os.environ.get("EARC_RS_HALF", "32"))
+RS_PHASES = 256
+RS_CUTOFF = 0.92   # of Nyquist: flat to ~20 kHz
+RS_BETA = 8.6      # ~86 dB stopband
 
 FRAME = CHANNELS * SAMPLE_BYTES
 BYTES_PER_SEC = RATE * FRAME
@@ -339,6 +385,100 @@ def log(msg):
     print("%s earc-recv: %s" % (time.strftime("%H:%M:%S"), msg), file=sys.stderr, flush=True)
 
 
+class Resampler:
+    """Variable-ratio windowed-sinc interpolation off the head of Buffer.data.
+
+    Output frame k is the input band-limited-interpolated at position
+    p_k = frac + k * step, counted in frames from the head of the buffer, using
+    input frames floor(p_k) - HALF + 1 .. floor(p_k) + HALF. The HALF - 1 frames
+    before the head that this needs are kept in `hist`, so successive calls
+    join seamlessly: the output is the same however the input was chunked. The
+    cost is HALF frames (0.7 ms) of lookahead that must be in the buffer.
+    """
+
+    def __init__(self, half=RS_HALF, phases=RS_PHASES, cutoff=RS_CUTOFF, beta=RS_BETA):
+        self.half = half
+        self.taps = 2 * half
+        self.phases = phases
+        frac = np.arange(phases + 1, dtype=np.float64) / phases
+        off = np.arange(self.taps, dtype=np.float64) - (half - 1)
+        x = off[None, :] - frac[:, None]            # tap distance from p, in frames
+        win = np.i0(beta * np.sqrt(np.clip(1.0 - (x / half) ** 2, 0.0, None))) / np.i0(beta)
+        h = cutoff * np.sinc(cutoff * x) * win
+        h /= h.sum(axis=1, keepdims=True)           # exact unity gain at DC
+        self.table = h.astype(np.float32)           # (phases + 1, taps)
+        self.reset()
+
+    def reset(self):
+        """Forget the past (after a gap, which fades back in from zero anyway)."""
+        self.hist = np.zeros((self.half - 1, CHANNELS), dtype=np.float32)
+        self.frac = 0.0
+
+    def run(self, data, step, nmax):
+        """Interpolate up to nmax frames from `data` (s16le bytearray) at `step`
+        input frames per output frame. Returns (float32 (n, CHANNELS), frames of
+        `data` consumed), or (None, 0) when the buffer cannot cover one frame."""
+        half = self.half
+        avail = len(data) // FRAME
+        room = avail - 1 - half - self.frac   # last p whose taps are all present
+        if room < 0:
+            return None, 0
+        n = min(int(room / step) + 1, nmax)
+        p = self.frac + step * np.arange(n + 1, dtype=np.float64)
+        need = int(p[n - 1]) + half + 1
+        # bytes() copies, so no numpy view pins the bytearray (it is resized).
+        new = np.frombuffer(bytes(data[:need * FRAME]), dtype="<i2").reshape(need, CHANNELS)
+        X = np.concatenate([self.hist, new.astype(np.float32)])   # X[j] = input j-(half-1)
+        i = p[:n].astype(np.int64)
+        ph = (p[:n] - i) * self.phases
+        j0 = np.minimum(ph.astype(np.int64), self.phases - 1)
+        w = (ph - j0).astype(np.float32)[:, None]
+        coef = self.table[j0] * (1.0 - w) + self.table[j0 + 1] * w              # (n, taps)
+        # Output k reads X[i_k .. i_k + taps - 1]. With the step this close to
+        # 1, i_k - k is constant except where the position slips a whole frame,
+        # at most once per call, so the windows of each run are one zero-copy
+        # strided view over X. (A gather of all n windows plus a batched matmul
+        # was 3x slower on the Pi 5: 720 vs 206 us per 5 ms.)
+        d0 = int(i[0])
+        if int(i[n - 1]) - (n - 1) == d0:       # no slip: the usual case
+            runs = ((0, n, d0),)
+        else:   # a 5 ms write has at most one; a long call (tests) many
+            cuts = [0] + list(np.flatnonzero(np.diff(i - np.arange(n))) + 1) + [n]
+            runs = [(a, b, int(i[a])) for a, b in zip(cuts[:-1], cuts[1:])]
+        out = np.empty((n, CHANNELS), dtype=np.float32)
+        s0, s1 = X.strides
+        for s, e, base in runs:
+            # win[k, c, t] = X[base + k + t, c], built directly: the numpy
+            # helper for this costs ~60 us of Python per call on the Pi 5.
+            win = np.ndarray((e - s, CHANNELS, self.taps), dtype=np.float32, buffer=X,
+                             offset=base * s0, strides=(s0, s1, s0))
+            out[s:e] = np.einsum("nct,nt->nc", win, coef[s:e])                 # (run, ch)
+        head = int(p[n])
+        self.frac = float(p[n] - head)
+        self.hist = X[head:head + half - 1].copy()   # input head-half+1 .. head-1
+        return out, head
+
+
+def load_ppm():
+    try:
+        with open(RS_STATE_FILE) as f:
+            v = float(f.read().split()[0])
+    except (OSError, ValueError, IndexError):
+        return 0.0
+    return max(-RS_MAX_PPM, min(RS_MAX_PPM, v))
+
+
+def save_ppm(v):
+    try:
+        os.makedirs(os.path.dirname(RS_STATE_FILE), exist_ok=True)
+        tmp = RS_STATE_FILE + ".tmp"
+        with open(tmp, "w") as f:
+            f.write("%.2f\n" % v)
+        os.replace(tmp, RS_STATE_FILE)
+    except OSError:
+        pass
+
+
 class Buffer:
     def __init__(self):
         self.lock = threading.Condition()
@@ -357,6 +497,18 @@ class Buffer:
         self.muted = True  # True when the last thing handed out was silence
         self.last = b""    # final frame of real audio, to decay out of
         self.drc = Drc()
+        # Adaptive resampling state (None = drop-only mode).
+        self.rs = Resampler() if (RESAMPLE and np is not None and SAMPLE_BYTES == 2) else None
+        self.rs_int = load_ppm() if self.rs is not None else 0.0  # integrator, ppm
+        self.rs_ppm = self.rs_int                                 # ratio applied, ppm
+        self.level_f = None    # low-passed fill in ms; None = re-seed on next take
+        self.rs_hold = 0.0     # seconds left with the integrator held, see _steer
+        self.rs_in = 0         # frames consumed / produced since the last stats
+        self.rs_out = 0        #   line, for the ratio actually realised
+        self.rs_lo = None
+        self.rs_hi = None
+        self.lvl_sum = 0.0     # for the mean fill in the stats line
+        self.lvl_n = 0
 
     def drop(self, nbytes):
         """Remove nbytes (whole frames) from the head of the buffer, which is the
@@ -403,7 +555,18 @@ class Buffer:
             # debt is still tracked so a drop that happens to coincide with a
             # repayment is not counted twice.
             hyst = int(DROP_HYST_MS / 1000.0 * BYTES_PER_SEC)
-            if len(self.data) > target + hyst:
+            if self.rs is not None:
+                # Drift is the resampler's job now; only a lump far above the
+                # mean (the sender catching up after a stall) is cut.
+                hi = int((RS_TARGET_MS + RS_COARSE_MS) / 1000.0 * BYTES_PER_SEC)
+                if len(self.data) > hi:
+                    keep = int((RS_TARGET_MS + RS_COARSE_MS / 2.0) / 1000.0 * BYTES_PER_SEC)
+                    give = (len(self.data) - keep) // FRAME * FRAME
+                    if give:
+                        self.drop(give)
+                        self.debt = max(0, self.debt - give)
+                        self.level_f = None
+            elif len(self.data) > target + hyst:
                 give = (len(self.data) - target) // FRAME * FRAME
                 if give:
                     self.drop(give)
@@ -428,15 +591,31 @@ class Buffer:
                 self.underrun_bytes += WRITE_BYTES
                 self.debt += WRITE_BYTES
                 return self._mute()
-            n = min(len(self.data) // FRAME * FRAME, WRITE_BYTES)
+            if self.rs is not None:
+                out, used = self.rs.run(self.data, 1.0 + self.rs_ppm * 1e-6, WRITE_FRAMES)
+                n = 0 if out is None else len(out) * FRAME
+            else:
+                n = min(len(self.data) // FRAME * FRAME, WRITE_BYTES)
             if n == 0:
                 self.underrun_bytes += WRITE_BYTES
                 self.debt += WRITE_BYTES
                 self.priming = True
                 self.low = 0
+                if self.rs is not None:
+                    self.rs.reset()
+                    self.level_f = None
                 return self._mute()
-            chunk = bytes(self.data[:n])
-            del self.data[:n]
+            if self.rs is not None:
+                del self.data[:used * FRAME]
+                self.rs_in += used
+                self.rs_out += len(out)
+                chunk = np.clip(np.rint(out), -32768, 32767).astype("<i2").tobytes()
+                self._steer(len(out))
+            else:
+                chunk = bytes(self.data[:n])
+                del self.data[:n]
+            self.lvl_sum += len(self.data)
+            self.lvl_n += 1
             if self.low is None or len(self.data) < self.low:
                 self.low = len(self.data)
             try:
@@ -450,6 +629,32 @@ class Buffer:
                 self.muted = False
             self.last = chunk[-FRAME:]
             return chunk
+
+    def _steer(self, frames):
+        """One step of the PI loop that sets the resampling ratio. Caller holds
+        the lock; `frames` is how much audio the last take() played."""
+        level = len(self.data) / BYTES_PER_SEC * 1000.0
+        dt = frames / float(RATE)
+        if self.level_f is None:
+            # Re-seeded after a prime, a reconnect or a cut. The level then
+            # starts well off target for reasons that are not drift (a fresh
+            # PREFILL_MS, or the rest of a lump), so the integrator -- which is
+            # the learnt drift -- is held until the proportional term has
+            # brought the level back near target, or RS_SETTLE_S has passed.
+            self.level_f = level
+            self.rs_hold = RS_SETTLE_S
+        else:
+            self.level_f += (level - self.level_f) * min(1.0, dt / RS_LEVEL_TAU)
+        err = self.level_f - RS_TARGET_MS
+        if self.rs_hold > 0.0:
+            self.rs_hold = 0.0 if abs(err) < RS_SETTLE_MS else self.rs_hold - dt
+        else:
+            self.rs_int = max(-RS_MAX_PPM, min(RS_MAX_PPM, self.rs_int + RS_KI * err * dt))
+        self.rs_ppm = max(-RS_MAX_PPM, min(RS_MAX_PPM, self.rs_int + RS_KP * err))
+        if self.rs_lo is None or self.rs_ppm < self.rs_lo:
+            self.rs_lo = self.rs_ppm
+        if self.rs_hi is None or self.rs_ppm > self.rs_hi:
+            self.rs_hi = self.rs_ppm
 
     def _mute(self):
         """Silence, decayed out of the last real audio on the first call.
@@ -523,6 +728,9 @@ def reader(buf):
                 # frame alignment, so channels can never rotate on resume.
                 buf.data.clear()
                 buf.priming = True
+                if buf.rs is not None:
+                    buf.rs.reset()
+                    buf.level_f = None
         time.sleep(RETRY_DELAY)
 
 
@@ -576,6 +784,12 @@ def main():
     shrink_stdout_pipe()
     pace = pipe_pacer()
     buf = Buffer()
+    if buf.rs is not None:
+        log("drift: adaptive resampling, mean target %.0f ms, %d taps, start %+.0f ppm"
+            % (RS_TARGET_MS, buf.rs.taps, buf.rs_int))
+    else:
+        log("drift: crossfaded drops (target %.0f ms + %.0f ms hysteresis)"
+            % (PREFILL_MS, DROP_HYST_MS))
     threading.Thread(target=reader, args=(buf,), daemon=True).start()
     out = sys.stdout.buffer
     last_stats = time.monotonic()
@@ -603,12 +817,27 @@ def main():
                     buf.low)
                 buf.peak = level
                 buf.low = None
+                mean = buf.lvl_sum / buf.lvl_n if buf.lvl_n else None
+                buf.lvl_sum, buf.lvl_n = 0.0, 0
+                rs_line = None
+                if buf.rs is not None:
+                    if buf.rs_out:
+                        realised = (buf.rs_in / float(buf.rs_out) - 1.0) * 1e6
+                        rs_line = "resample %+.0f ppm (%+.0f..%+.0f)" % (
+                            realised, buf.rs_lo, buf.rs_hi)
+                        save_ppm(buf.rs_int)
+                    else:
+                        rs_line = "resample idle"
+                    buf.rs_in = buf.rs_out = 0
+                    buf.rs_lo = buf.rs_hi = None
             du, dd, dr = under - base[0], dropped - base[1], reconnects - base[2]
             base = (under, dropped, reconnects)
             low_s = "-" if low is None else "%.0fms" % ms(low)
-            log("buffer %.0fms (low %s, peak %.0fms) | last %.0fs: silence inserted %.0fms, "
-                "dropped %.0fms, reconnects %d"
-                % (ms(level), low_s, ms(peak), now - last_stats, ms(du), ms(dd), dr))
+            mean_s = "" if mean is None else ", mean %.0fms" % ms(mean)
+            log("buffer %.0fms (low %s, peak %.0fms%s) | last %.0fs: silence inserted %.0fms, "
+                "dropped %.0fms, reconnects %d%s"
+                % (ms(level), low_s, ms(peak), mean_s, now - last_stats, ms(du), ms(dd), dr,
+                   "" if rs_line is None else " | " + rs_line))
             with buf.lock:
                 drc_line = buf.drc.stats()
             if drc_line:

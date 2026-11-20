@@ -6,6 +6,11 @@ change to earc-streamer.py's Output class or earc-recv.py's Buffer.
   python3 tests/test_fade2.py        [path]   boundary ramps in isolation
   python3 tests/test_output_e2e.py   [path]   the real Output class, start to finish
   python3 tests/test_settle.py       [path]   the E-AC-3 decoder settling discard
+  python3 -m unittest tests/test_resample.py  earc-recv's adaptive resampling
+      (fix 3, 2026-11-20): interpolator quality vs an exactly resampled sine,
+      chunking invariance, the PI loop in a virtual-time model of the chain,
+      stall recovery, starve/recover clicks, EARC_RESAMPLE=0 fallback. Uses
+      THIS checkout's htpc/bin/earc-recv.py; needs numpy; ~1 min.
 
 `path` defaults to the INSTALLED /usr/local/lib/earc/earc-streamer.py; pass
 ~/claude/earc-streamer.py to test an uninstalled edit.
